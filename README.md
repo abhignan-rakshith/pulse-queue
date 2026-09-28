@@ -1,6 +1,6 @@
 # pulse-queue
 
-[![CI](https://github.com/abhignan-rakshith/pulse-queue/actions/workflows/ci.yml/badge.svg)](https://github.com/abhignan-rakshith/pulse-queue/actions/workflows/ci.yml)
+[![CI](https://github.com/abhignan-rakshith/pulse-queue/actions/workflows/ci.yml/badge.svg)](https://github.com/abhignan-rakshith/pulse-queue/actions/workflows/ci.yml) [![PyPI](https://img.shields.io/pypi/v/pulse-queue.svg)](https://pypi.org/project/pulse-queue/)
 
 A standalone background task queue built on SQLite and `asyncio`. One file on
 disk is the whole broker: no Redis, no separate server process, and no runtime
