@@ -1,0 +1,35 @@
+[project]
+name = "pulse-queue"
+version = "0.1.0"
+description = "Standalone SQLite-backed asyncio task queue with leases, retries, and a DLQ"
+readme = "README.md"
+authors = [
+    { name = "Abhignan Rakshith", email = "abhignanrakshith@icloud.com" }
+]
+requires-python = ">=3.14"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/abhignanrakshith/pulse-queue"
+
+[project.scripts]
+pulse-queue = "pulse_queue.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "src"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: spawns real subprocesses; deselect with -m 'not integration'",
+]
+addopts = "-q --strict-markers --doctest-modules"
