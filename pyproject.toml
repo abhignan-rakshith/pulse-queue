@@ -1,16 +1,27 @@
 [project]
 name = "pulse-queue"
 version = "0.1.0"
-description = "Standalone SQLite-backed asyncio task queue with leases, retries, and a DLQ"
+description = "A lightweight, zero-dependency SQLite WAL-backed asyncio task queue with fencing tokens and DLQ replay."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Abhignan Rakshith", email = "abhignanrakshith@icloud.com" }
 ]
-requires-python = ">=3.14"
+requires-python = ">=3.12"
+classifiers = [
+    "Framework :: AsyncIO",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+]
 dependencies = []
 
 [project.urls]
-Repository = "https://github.com/abhignanrakshith/pulse-queue"
+Homepage = "https://github.com/abhignan-rakshith/pulse-queue"
+Repository = "https://github.com/abhignan-rakshith/pulse-queue"
+Issues = "https://github.com/abhignan-rakshith/pulse-queue/issues"
 
 [project.scripts]
 pulse-queue = "pulse_queue.cli:main"

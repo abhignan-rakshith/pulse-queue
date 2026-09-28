@@ -1,7 +1,10 @@
 # pulse-queue
 
+[![CI](https://github.com/abhignan-rakshith/pulse-queue/actions/workflows/ci.yml/badge.svg)](https://github.com/abhignan-rakshith/pulse-queue/actions/workflows/ci.yml)
+
 A standalone background task queue built on SQLite and `asyncio`. One file on
-disk is the whole broker: no Redis, no separate server process.
+disk is the whole broker: no Redis, no separate server process, and no runtime
+dependencies beyond the standard library.
 
 - **WAL-mode SQLite** with transactional lease and state transitions
 - **Retry with exponential backoff**, then a **dead letter queue**
@@ -10,6 +13,7 @@ disk is the whole broker: no Redis, no separate server process.
 - **Lease expiry recovery**, so `SIGKILL` or a host reboot does not lose work
 - **Fenced leases**, so a stalled worker whose lease was reclaimed cannot
   overwrite the result of whoever took over
+- **DLQ replay** from the CLI, preserving the original task id
 
 ## Install
 
@@ -17,28 +21,60 @@ disk is the whole broker: no Redis, no separate server process.
 uv add pulse-queue
 ```
 
-Requires Python 3.14+. No runtime dependencies beyond the standard library.
+or, with pip:
 
-## Library
+```sh
+pip install pulse-queue
+```
 
-Define handlers against a registry, then run a pool:
+Requires Python 3.12+. No runtime dependencies beyond the standard library.
+
+## Quickstart
+
+Define handlers against a registry, enqueue a payload, then run a pool. The
+snippet below follows [`demo.py`](demo.py), which pushes five tasks through a
+two-worker pool -- two successes, one permanent failure, and two that exhaust
+their attempt budget -- and prints every final state plus the dead letter
+queue:
 
 ```python
-from pulse_queue import HandlerRegistry, Store, WorkerPool
+import asyncio
+
+from pulse_queue import HandlerRegistry, Store, TaskStatus, WorkerPool
 
 registry = HandlerRegistry()
 
 
 @registry.register("send_email")
-async def send_email(ctx):
-    await smtp_send(ctx.payload["to"], idempotency_key=ctx.task_id)
+async def send_email(ctx) -> str:
+    print(f"delivering to {ctx.payload['to']} (attempt {ctx.attempt})")
+    return f"delivered to {ctx.payload['to']}"
 
 
-store = Store("pulse.db")
-store.enqueue({"type": "send_email", "to": "ada@example.com"})
+async def main() -> None:
+    store = Store("pulse.db")
+    try:
+        store.enqueue({"type": "send_email", "to": "ada@example.com"}, priority=10)
 
-pool = WorkerPool(store, registry, concurrency=8)
-asyncio.run(pool.run())  # blocks until SIGINT/SIGTERM, then drains
+        pool = WorkerPool(store, registry, concurrency=2)
+        await pool.start()
+        try:
+            active = (TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.RETRY)
+            pending = sum([await pool.async_store.count_tasks(s) for s in active])
+            while pending:
+                await asyncio.sleep(0.02)
+                pending = sum([await pool.async_store.count_tasks(s) for s in active])
+        finally:
+            pool.stop()
+            await pool.aclose()
+
+        print("completed:", store.count_tasks(TaskStatus.COMPLETED))
+    finally:
+        store.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
 A handler's outcome selects the transition:
@@ -48,6 +84,37 @@ A handler's outcome selects the transition:
 | returns | `COMPLETED` |
 | `PermanentTaskError` | `FAILED` (no retry) |
 | anything else | `RETRY` with backoff, then `DLQ` once the budget is spent |
+
+`demo.py` asserts those transitions at the end, so it doubles as an end-to-end
+smoke test:
+
+```sh
+uv run python demo.py
+```
+
+## Architecture
+
+Everything lives in one SQLite file. `Store` owns a single connection opened in
+WAL mode (`journal_mode=wal`, `busy_timeout=5000`, foreign keys on) and applies
+forward-only migrations on construction. `WorkerPool` wraps the store in
+`AsyncStore`, an async facade that serializes calls through one lock and runs
+them in a worker thread, so a single connection stays safe for concurrent
+workers.
+
+| Component | Role |
+| --- | --- |
+| `tasks` table | Canonical queue: payload, state, priority, attempt budget, availability, lease columns |
+| `dead_letter_queue` table | Terminal record for tasks that spent their attempt budget; replayed by id |
+| `Store` | Migrations, transactional enqueue, claim, complete/fail/retry/dead-letter |
+| `Worker` / `WorkerPool` | Worker slots, lease heartbeats, expiry reclamation, graceful drain |
+
+A claim is a single `UPDATE ... RETURNING` that selects the highest-priority
+available task and stamps a fresh lease, so two workers can never be handed the
+same row. The lease is a fencing token -- `(lease_owner, lease_epoch)` -- and
+every transition (complete, fail, retry, dead-letter, heartbeat) must present
+the epoch it was claimed with. Migrations run one transaction per version with
+the version row written last, so a migration that fails rolls back completely
+and is retried on the next open.
 
 ### Delivery semantics
 
@@ -171,4 +238,5 @@ subprocess lifetimes. The full suite runs in about 3.7 s.
 ```sh
 uv run pytest                      # everything
 uv run pytest -m "not integration" # skip the subprocess tests
+uv run ruff check .                # lint
 ```
