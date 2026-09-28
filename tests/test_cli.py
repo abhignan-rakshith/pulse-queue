@@ -125,7 +125,9 @@ def seeded_dlq(db_path):
                 max_attempts=0,
             )
             task = store.lease_next_task(f"w{index}")
-            store.dead_letter(task.id, f"w{index}", f"failure {index}")
+            store.dead_letter(
+                task.id, f"w{index}", task.lease_epoch, f"failure {index}"
+            )
             clock.advance(10.0)
     return db_path
 
@@ -514,8 +516,8 @@ def test_dlq_list_is_newest_first(seeded_dlq, capsys) -> None:
 def test_dlq_list_clips_long_errors_unless_wide(db_path, capsys) -> None:
     with Store(db_path) as store:
         store.enqueue({"type": "x"}, task_id="t", max_attempts=0)
-        store.lease_next_task("w")
-        store.dead_letter("t", "w", "E" * 200)
+        claimed = store.lease_next_task("w")
+        store.dead_letter("t", "w", claimed.lease_epoch, "E" * 200)
 
     _, clipped, _ = run(["--db", str(db_path), "dlq", "list"], capsys)
     assert "\u2026" in clipped
@@ -649,7 +651,7 @@ def test_replay_all_skips_conflicts_without_aborting(db_path, capsys) -> None:
                 {"type": "x", "i": index}, task_id=f"c-{index}", max_attempts=0
             )
             task = store.lease_next_task(f"w{index}")
-            store.dead_letter(task.id, f"w{index}", "boom")
+            store.dead_letter(task.id, f"w{index}", task.lease_epoch, "boom")
         # c-0 is active again, so replaying it would clobber a live task.
         store.enqueue({"type": "x", "v": 2}, task_id="c-0")
 
@@ -670,8 +672,8 @@ def test_replay_all_skips_conflicts_without_aborting(db_path, capsys) -> None:
 def test_replay_all_exits_nonzero_when_everything_is_skipped(db_path, capsys) -> None:
     with Store(db_path) as store:
         store.enqueue({"type": "x"}, task_id="c", max_attempts=0)
-        store.lease_next_task("w")
-        store.dead_letter("c", "w", "boom")
+        claimed = store.lease_next_task("w")
+        store.dead_letter("c", "w", claimed.lease_epoch, "boom")
         store.enqueue({"type": "x", "v": 2}, task_id="c")
 
     code, out, err = run(["--db", str(db_path), "dlq", "replay", "--all"], capsys)

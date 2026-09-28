@@ -24,7 +24,7 @@ from ._sqlite import transaction
 from .errors import StoreError
 
 #: Bump when adding a migration below.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 #: Minimum SQLite needed to apply pending migrations.
 #:
@@ -107,10 +107,28 @@ ALTER TABLE dead_letter_queue DROP COLUMN revived_at;
 ALTER TABLE dead_letter_queue DROP COLUMN revive_count;
 """
 
+#: Adds the fencing token that every lease-bound transition must present.
+#:
+#: ``lease_owner`` alone cannot fence, because it is a *name* rather than an
+#: identity. Two pools sharing a database are constructed from the same default
+#: prefix, so both field a ``worker-0``; a worker whose lease expired could then
+#: present exactly the string the reclaiming worker holds and have its stale
+#: result accepted, overwriting newer state. Bumping a per-task counter at claim
+#: time gives every lease a generation that cannot repeat, so a stale holder is
+#: rejected whatever it calls itself -- including a pool racing with *itself*
+#: after a reclaim.
+#:
+#: Backfills to 0 for existing rows. Unclaimed tasks sit at 0; the first claim
+#: makes it 1.
+_MIGRATION_V4 = """
+ALTER TABLE tasks ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0;
+"""
+
 _MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, _MIGRATION_V1),
     (2, _MIGRATION_V2),
     (3, _MIGRATION_V3),
+    (4, _MIGRATION_V4),
 )
 
 

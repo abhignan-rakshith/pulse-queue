@@ -108,7 +108,7 @@ def test_backoff_integration_with_store(store, clock) -> None:
     task = store.lease_next_task("w1")
 
     next_at = policy.next_available_at(clock.now(), attempt=task.attempts - 1)
-    store.fail_task(task.id, "w1", "boom", available_at=next_at)
+    store.fail_task(task.id, "w1", task.lease_epoch, "boom", available_at=next_at)
 
     clock.advance(4.9)
     assert store.lease_next_task("w2") is None

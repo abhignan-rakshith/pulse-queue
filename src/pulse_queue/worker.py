@@ -25,6 +25,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
+import os
 import random
 import signal
 import threading
@@ -237,13 +238,18 @@ class AsyncStore:
             lease_ttl=lease_ttl,
         )
 
-    async def complete_task(self, task_id: str, worker_id: str) -> bool:
-        return await self._call(self._store.complete_task, task_id, worker_id)
+    async def complete_task(
+        self, task_id: str, worker_id: str, lease_epoch: int
+    ) -> bool:
+        return await self._call(
+            self._store.complete_task, task_id, worker_id, lease_epoch
+        )
 
     async def fail_task(
         self,
         task_id: str,
         worker_id: str,
+        lease_epoch: int,
         error: str,
         *,
         retry: bool = True,
@@ -253,17 +259,24 @@ class AsyncStore:
             self._store.fail_task,
             task_id,
             worker_id,
+            lease_epoch,
             error,
             retry=retry,
             available_at=available_at,
         )
 
-    async def dead_letter(self, task_id: str, worker_id: str, error: str) -> bool:
-        return await self._call(self._store.dead_letter, task_id, worker_id, error)
-
-    async def renew_lease(self, task_id: str, worker_id: str, lease_ttl: float) -> bool:
+    async def dead_letter(
+        self, task_id: str, worker_id: str, lease_epoch: int, error: str
+    ) -> bool:
         return await self._call(
-            self._store.renew_lease, task_id, worker_id, lease_ttl
+            self._store.dead_letter, task_id, worker_id, lease_epoch, error
+        )
+
+    async def renew_lease(
+        self, task_id: str, worker_id: str, lease_epoch: int, lease_ttl: float
+    ) -> bool:
+        return await self._call(
+            self._store.renew_lease, task_id, worker_id, lease_epoch, lease_ttl
         )
 
     async def reclaim_expired(self, *, backoff: float = 0.0) -> int:
@@ -413,7 +426,7 @@ class Worker:
         """Run one attempt and route the outcome to the correct transition."""
         ctx = task.context()
         heartbeat = asyncio.create_task(
-            self._heartbeat(task.id), name=f"heartbeat:{task.id[:8]}"
+            self._heartbeat(task), name=f"heartbeat:{task.id[:8]}"
         )
         try:
             handler = self.registry.resolve(self.type_resolver(ctx.payload))
@@ -446,17 +459,17 @@ class Worker:
         # A timeout surfaces as TimeoutError and takes the normal retry path.
         return await asyncio.wait_for(result, timeout=self.handler_timeout)
 
-    async def _heartbeat(self, task_id: str) -> None:
+    async def _heartbeat(self, task: Task) -> None:
         """Keep the lease alive while a long handler runs."""
         while True:
             await asyncio.sleep(self.heartbeat_interval)
             try:
                 renewed = await self.store.renew_lease(
-                    task_id, self.worker_id, self.lease_ttl
+                    task.id, self.worker_id, task.lease_epoch, self.lease_ttl
                 )
             except Exception:  # noqa: BLE001 -- never fail the task over this
                 logger.warning(
-                    "heartbeat failed for task %s on %s", task_id, self.worker_id,
+                    "heartbeat failed for task %s on %s", task.id, self.worker_id,
                     exc_info=True,
                 )
                 return
@@ -466,7 +479,7 @@ class Worker:
                 self.stats.lease_lost += 1
                 logger.warning(
                     "lease lost for task %s (worker %s); result will be discarded",
-                    task_id,
+                    task.id,
                     self.worker_id,
                 )
                 return
@@ -474,13 +487,13 @@ class Worker:
     # ------------------------------------------------------------ transitions
 
     async def _complete(self, task: Task) -> None:
-        if await self.store.complete_task(task.id, self.worker_id):
+        if await self.store.complete_task(task.id, self.worker_id, task.lease_epoch):
             self.stats.completed += 1
             logger.debug("completed task %s", task.id)
             return
 
-        # The lease_owner guard rejected the write: the task was reclaimed
-        # while we were running it. Dropping the result is the correct outcome.
+        # The (worker_id, lease_epoch) guard rejected the write: the task was
+        # reclaimed while we were running it. Dropping the result is correct.
         self.stats.lease_lost += 1
         logger.warning(
             "task %s completed by %s but the lease was lost; result discarded",
@@ -490,7 +503,10 @@ class Worker:
 
     async def _fail_permanently(self, task: Task, exc: BaseException) -> None:
         error = f"{type(exc).__name__}: {exc}"
-        if await self.store.fail_task(task.id, self.worker_id, error, retry=False):
+        ok = await self.store.fail_task(
+            task.id, self.worker_id, task.lease_epoch, error, retry=False
+        )
+        if ok:
             self.stats.failed_permanently += 1
             logger.error("task %s failed permanently: %s", task.id, error)
         else:
@@ -506,7 +522,12 @@ class Worker:
             delay = self.backoff.delay_for(task.attempts - 1, rng=self._rng)
             available_at = self.store.clock_now + delay
             ok = await self.store.fail_task(
-                task.id, self.worker_id, error, retry=True, available_at=available_at
+                task.id,
+                self.worker_id,
+                task.lease_epoch,
+                error,
+                retry=True,
+                available_at=available_at,
             )
             if ok:
                 self.stats.retried += 1
@@ -523,7 +544,9 @@ class Worker:
                 logger.warning("lease lost while retrying task %s", task.id)
             return
 
-        if await self.store.dead_letter(task.id, self.worker_id, error):
+        if await self.store.dead_letter(
+            task.id, self.worker_id, task.lease_epoch, error
+        ):
             self.stats.dead_lettered += 1
             logger.error(
                 "task %s exhausted %d attempt(s); dead-lettered: %s",
@@ -543,6 +566,7 @@ class Worker:
             released = await self.store.fail_task(
                 task.id,
                 self.worker_id,
+                task.lease_epoch,
                 "worker cancelled before completion (graceful shutdown)",
                 retry=True,
                 available_at=self.store.clock_now,
@@ -619,11 +643,21 @@ class WorkerPool:
 
         # One rng per pool, so backoff jitter compares across workers.
         shared_rng = rng or random.Random()
+
+        # Worker ids must be unique across every pool sharing a database, not
+        # just within this one: lease_owner is a name, and identical names let
+        # a worker whose lease was reclaimed present the string the reclaiming
+        # worker holds. The lease epoch rejects that outright, but a distinct
+        # name keeps lease_owner meaningful in logs and diagnostics. The token
+        # mixes the process id (operator correlation) with randomness, which is
+        # what actually guarantees uniqueness -- container PIDs all collide at
+        # 1, and two pools in one process share a PID.
+        pool_token = f"{os.getpid()}-{uuid.uuid4().hex[:6]}"
         self.workers: list[Worker] = [
             Worker(
                 self.async_store,
                 registry,
-                worker_id=f"{worker_id_prefix}-{i}",
+                worker_id=f"{worker_id_prefix}-{pool_token}-{i}",
                 queues=self.queues,
                 poll_interval=poll_interval,
                 idle_backoff_max=idle_backoff_max,

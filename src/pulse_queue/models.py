@@ -81,6 +81,11 @@ class Task:
     available_at: float
     lease_owner: str | None
     lease_expires_at: float | None
+    #: Monotonic lease generation, bumped by every claim. Together with
+    #: ``lease_owner`` this is the fencing token a transition must present:
+    #: the owner string is only a name and two pools can share one, but the
+    #: epoch cannot repeat, so a worker whose lease was reclaimed is rejected.
+    lease_epoch: int
     last_error: str | None
     created_at: float
     updated_at: float
@@ -101,6 +106,7 @@ class Task:
             available_at=row["available_at"],
             lease_owner=row["lease_owner"],
             lease_expires_at=row["lease_expires_at"],
+            lease_epoch=row["lease_epoch"],
             last_error=row["last_error"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
@@ -114,7 +120,8 @@ class Task:
         >>> Task(
         ...     id="t", queue="default", payload=b'{"a": 1}', state=TaskStatus.PENDING,
         ...     priority=0, attempts=0, max_attempts=3, available_at=0.0,
-        ...     lease_owner=None, lease_expires_at=None, last_error=None,
+        ...     lease_owner=None, lease_expires_at=None, lease_epoch=0,
+        ...     last_error=None,
         ...     created_at=0.0, updated_at=0.0, started_at=None, finished_at=None,
         ... ).decode_payload()
         {'a': 1}

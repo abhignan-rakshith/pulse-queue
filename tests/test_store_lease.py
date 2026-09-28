@@ -19,6 +19,8 @@ def test_lease_marks_running_and_increments_attempts(store: Store, clock) -> Non
     assert task.lease_owner == "worker-1"
     assert task.lease_expires_at == clock.now() + 60.0
     assert task.started_at == clock.now()
+    # The first claim opens generation 1; the epoch only ever moves forward.
+    assert task.lease_epoch == 1
 
 
 def test_lease_returns_none_when_empty(store: Store) -> None:
@@ -93,14 +95,16 @@ def test_queue_filter_restricts_claims(store: Store) -> None:
 def test_stale_worker_cannot_complete_after_reclaim(store: Store, clock) -> None:
     """A zombie worker must not clobber the new owner's state.
 
-    This is the single most important invariant in the design: without the
-    ``lease_owner`` guard, a paused worker resuming after its lease expired
-    would overwrite the result of whoever re-ran the task.
+    This is the single most important invariant in the design: without a fence,
+    a paused worker resuming after its lease expired would overwrite the result
+    of whoever re-ran the task. The fence is ``(lease_owner, lease_epoch)`` --
+    the owner is only a name, so the generation is what actually rejects it.
     """
     store.enqueue({"a": 1})
 
     zombie = store.lease_next_task("zombie", lease_ttl=10.0)
     assert zombie is not None
+    assert zombie.lease_epoch == 1
 
     # Lease expires; a second worker reclaims the task.
     clock.advance(11.0)
@@ -108,27 +112,71 @@ def test_stale_worker_cannot_complete_after_reclaim(store: Store, clock) -> None
     successor = store.lease_next_task("successor", lease_ttl=10.0)
     assert successor is not None
     assert successor.attempts == 2
+    assert successor.lease_epoch == 2
 
     # The zombie finishes and tries to report success -- rejected.
-    assert store.complete_task(zombie.id, "zombie") is False
-    assert store.fail_task(zombie.id, "zombie", "boom") is False
+    assert store.complete_task(zombie.id, "zombie", zombie.lease_epoch) is False
+    assert store.fail_task(zombie.id, "zombie", zombie.lease_epoch, "boom") is False
 
     # Successor still owns it and its state is untouched.
     current = store.get_task(zombie.id)
     assert current.lease_owner == "successor"
+    assert current.lease_epoch == 2
     assert current.state is TaskStatus.RUNNING
 
-    assert store.complete_task(successor.id, "successor") is True
+    assert (
+        store.complete_task(successor.id, "successor", successor.lease_epoch) is True
+    )
     assert store.get_task(successor.id).state is TaskStatus.COMPLETED
 
 
-def test_complete_requires_matching_owner(store: Store) -> None:
+def test_a_worker_cannot_finish_a_lease_it_no_longer_holds(
+    store: Store, clock
+) -> None:
+    """The fence must hold when the reclaiming worker has the *same name*.
+
+    Two pools sharing a database are built from the same default prefix, so
+    both field a ``worker-0``. No owner-name comparison can separate those
+    leases -- only the bumped epoch can. This is the regression test for that
+    collision.
+    """
+    store.enqueue({"a": 1})
+
+    stale = store.lease_next_task("worker-0", lease_ttl=10.0)
+    assert stale.lease_epoch == 1
+
+    clock.advance(11.0)
+    assert store.reclaim_expired() == 1
+
+    fresh = store.lease_next_task("worker-0", lease_ttl=10.0)
+    assert fresh.id == stale.id
+    assert fresh.lease_epoch == 2  # same name, different generation
+
+    # Every transition the stale holder could attempt is rejected.
+    assert store.complete_task(stale.id, "worker-0", stale.lease_epoch) is False
+    assert store.fail_task(stale.id, "worker-0", stale.lease_epoch, "stale") is False
+    assert (
+        store.dead_letter(stale.id, "worker-0", stale.lease_epoch, "stale") is False
+    )
+    assert store.renew_lease(stale.id, "worker-0", stale.lease_epoch, 30.0) is False
+
+    # The fresh lease is untouched by all of that, and still the live one.
+    assert store.get_task(stale.id).state is TaskStatus.RUNNING
+    assert store.count_tasks() == 1
+    assert store.complete_task(fresh.id, "worker-0", fresh.lease_epoch) is True
+
+
+def test_complete_requires_matching_owner_and_epoch(store: Store) -> None:
     store.enqueue({"a": 1})
     task = store.lease_next_task("w1")
 
-    assert store.complete_task(task.id, "w2") is False
+    # Right generation, wrong name.
+    assert store.complete_task(task.id, "w2", task.lease_epoch) is False
+    # Right name, wrong generation.
+    assert store.complete_task(task.id, "w1", task.lease_epoch + 1) is False
     assert store.get_task(task.id).state is TaskStatus.RUNNING
-    assert store.complete_task(task.id, "w1") is True
+
+    assert store.complete_task(task.id, "w1", task.lease_epoch) is True
 
 
 def test_complete_is_not_replayable(store: Store) -> None:
@@ -136,8 +184,8 @@ def test_complete_is_not_replayable(store: Store) -> None:
     store.enqueue({"a": 1})
     task = store.lease_next_task("w1")
 
-    assert store.complete_task(task.id, "w1") is True
-    assert store.complete_task(task.id, "w1") is False
+    assert store.complete_task(task.id, "w1", task.lease_epoch) is True
+    assert store.complete_task(task.id, "w1", task.lease_epoch) is False
 
 
 # ----------------------------------------------------------- crash recovery
@@ -185,11 +233,18 @@ def test_renew_lease_extends_and_is_fenced(store: Store, clock) -> None:
     task = store.lease_next_task("w1", lease_ttl=10.0)
 
     clock.advance(8.0)
-    assert store.renew_lease(task.id, "w1", lease_ttl=30.0) is True
+    assert store.renew_lease(task.id, "w1", task.lease_epoch, lease_ttl=30.0) is True
     assert store.get_task(task.id).lease_expires_at == clock.now() + 30.0
 
     # Wrong owner cannot renew.
-    assert store.renew_lease(task.id, "impostor", lease_ttl=30.0) is False
+    assert (
+        store.renew_lease(task.id, "impostor", task.lease_epoch, lease_ttl=30.0)
+        is False
+    )
+    # Neither can the right owner with a stale generation.
+    assert (
+        store.renew_lease(task.id, "w1", task.lease_epoch + 1, lease_ttl=30.0) is False
+    )
 
 
 def test_reclaim_ignores_unexpired_leases(store: Store) -> None:
@@ -205,7 +260,9 @@ def test_renew_lease_prevents_reclaim(store: Store, clock) -> None:
 
     for _ in range(5):
         clock.advance(8.0)
-        assert store.renew_lease(task.id, "w", lease_ttl=10.0) is True
+        assert (
+            store.renew_lease(task.id, "w", task.lease_epoch, lease_ttl=10.0) is True
+        )
         assert store.reclaim_expired() == 0
 
     assert store.get_task(task.id).state is TaskStatus.RUNNING

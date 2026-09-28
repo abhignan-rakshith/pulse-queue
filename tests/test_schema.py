@@ -98,13 +98,14 @@ def _legacy_v1_database(path) -> sqlite3.Connection:
     return conn
 
 
-def test_upgrade_path_v1_to_v2_to_v3(tmp_path) -> None:
+def test_upgrade_path_v1_to_v4(tmp_path) -> None:
     """Every step of the upgrade is inspectable and preserves existing rows."""
     conn = _legacy_v1_database(tmp_path / "legacy.db")
 
     # ---- v1: the original shape -----------------------------------------
     assert current_version(conn) == 1
     assert "max_retries" in _columns(conn, "tasks")
+    assert "lease_epoch" not in _columns(conn, "tasks")
     dlq_columns = _columns(conn, "dead_letter_queue")
     assert {"revived_at", "revive_count"} <= dlq_columns
     assert "priority" not in dlq_columns
@@ -151,15 +152,27 @@ def test_upgrade_path_v1_to_v2_to_v3(tmp_path) -> None:
     }
     assert "idx_dlq_failed_at" in indexes
 
+    # ---- v4: add the lease fencing token --------------------------------
+    _apply_through(conn, 4)
+    assert current_version(conn) == 4
+    assert "lease_epoch" in _columns(conn, "tasks")
+
+    # The row predates leases entirely, so it backfills to generation 0: the
+    # column must not manufacture a claim that never happened.
+    row = conn.execute("SELECT lease_epoch, max_attempts FROM tasks").fetchone()
+    assert row["lease_epoch"] == 0
+    assert row["max_attempts"] == 7  # v2's rename still stands
+
     # And the whole path is idempotent once complete.
-    assert migrate(conn) == SCHEMA_VERSION == 3
+    assert migrate(conn) == SCHEMA_VERSION == 4
     conn.close()
 
 
 def test_fresh_database_lands_on_the_current_schema(store: Store) -> None:
     """A new database replays every migration and keeps none of the debris."""
-    assert store.schema_version == SCHEMA_VERSION == 3
+    assert store.schema_version == SCHEMA_VERSION == 4
     assert "max_retries" not in _columns(store._conn, "tasks")
+    assert "lease_epoch" in _columns(store._conn, "tasks")
     assert "revived_at" not in _columns(store._conn, "dead_letter_queue")
     assert "revive_count" not in _columns(store._conn, "dead_letter_queue")
 

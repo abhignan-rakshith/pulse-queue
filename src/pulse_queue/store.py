@@ -207,6 +207,10 @@ class Store:
         mid-handler still consumes an attempt, which is what keeps a poison
         task from looping forever.
 
+        It also increments ``lease_epoch``, which is the fencing token for this
+        lease. Every later transition must present the epoch returned here;
+        see :meth:`complete_task`.
+
         Args:
             worker_id: Identity recorded as ``lease_owner``. Later state
                 transitions require this to match, fencing out a zombie worker
@@ -226,6 +230,7 @@ class Store:
                         state            = 'RUNNING',
                         lease_owner      = ?,
                         lease_expires_at = ?,
+                        lease_epoch      = lease_epoch + 1,
                         attempts         = attempts + 1,
                         started_at       = COALESCE(started_at, ?),
                         updated_at       = ?
@@ -246,19 +251,22 @@ class Store:
 
         return Task.from_row(row) if row is not None else None
 
-    def complete_task(self, task_id: str, worker_id: str) -> bool:
+    def complete_task(self, task_id: str, worker_id: str, lease_epoch: int) -> bool:
         """Mark a task COMPLETED. Returns ``False`` if the lease was lost.
 
-        The ``lease_owner`` guard is the fencing mechanism: a worker whose
-        lease expired and was reclaimed gets ``False`` and must discard its
-        result rather than overwrite the new owner's state.
+        ``(worker_id, lease_epoch)`` is the fencing token: a worker whose lease
+        expired and was reclaimed gets ``False`` and must discard its result
+        rather than overwrite the new owner's state. Both halves are required --
+        the owner is only a name, and two pools sharing a database can field the
+        same one, but the epoch is bumped on every claim and so cannot repeat.
         """
-        return self._finish(task_id, worker_id, TaskStatus.COMPLETED)
+        return self._finish(task_id, worker_id, lease_epoch, TaskStatus.COMPLETED)
 
     def fail_task(
         self,
         task_id: str,
         worker_id: str,
+        lease_epoch: int,
         error: str,
         *,
         retry: bool = True,
@@ -271,7 +279,8 @@ class Store:
         moves to FAILED and stays visible for inspection.
 
         Returns ``False`` if the lease was lost, in which case nothing was
-        written -- the reclaimer already owns this task.
+        written -- the reclaimer already owns this task. See
+        :meth:`complete_task` for why ``lease_epoch`` is required.
         """
         now = self.clock.now()
         if available_at is None:
@@ -290,7 +299,8 @@ class Store:
                         lease_expires_at = ?,
                         finished_at      = CASE WHEN ? = 'FAILED' THEN ? ELSE NULL END,
                         updated_at       = ?
-                    WHERE id = ? AND lease_owner = ? AND state = 'RUNNING'
+                    WHERE id = ? AND lease_owner = ? AND lease_epoch = ?
+                      AND state = 'RUNNING'
                     """,
                     (
                         status.value,
@@ -306,6 +316,7 @@ class Store:
                         now,
                         task_id,
                         worker_id,
+                        lease_epoch,
                     ),
                 )
         except sqlite3.Error as exc:
@@ -313,7 +324,9 @@ class Store:
 
         return cur.rowcount == 1
 
-    def _finish(self, task_id: str, worker_id: str, status: TaskStatus) -> bool:
+    def _finish(
+        self, task_id: str, worker_id: str, lease_epoch: int, status: TaskStatus
+    ) -> bool:
         now = self.clock.now()
         try:
             with transaction(self._conn):
@@ -325,15 +338,18 @@ class Store:
                         lease_expires_at = NULL,
                         finished_at      = ?,
                         updated_at       = ?
-                    WHERE id = ? AND lease_owner = ? AND state = 'RUNNING'
+                    WHERE id = ? AND lease_owner = ? AND lease_epoch = ?
+                      AND state = 'RUNNING'
                     """,
-                    (status.value, now, now, task_id, worker_id),
+                    (status.value, now, now, task_id, worker_id, lease_epoch),
                 )
         except sqlite3.Error as exc:
             raise StoreError(f"state transition failed: {exc}") from exc
         return cur.rowcount == 1
 
-    def renew_lease(self, task_id: str, worker_id: str, lease_ttl: float) -> bool:
+    def renew_lease(
+        self, task_id: str, worker_id: str, lease_epoch: int, lease_ttl: float
+    ) -> bool:
         """Extend a lease held by ``worker_id``. False if the lease was lost."""
         now = self.clock.now()
         try:
@@ -341,9 +357,10 @@ class Store:
                 cur = self._conn.execute(
                     """
                     UPDATE tasks SET lease_expires_at = ?, updated_at = ?
-                    WHERE id = ? AND lease_owner = ? AND state = 'RUNNING'
+                    WHERE id = ? AND lease_owner = ? AND lease_epoch = ?
+                      AND state = 'RUNNING'
                     """,
-                    (now + lease_ttl, now, task_id, worker_id),
+                    (now + lease_ttl, now, task_id, worker_id, lease_epoch),
                 )
         except sqlite3.Error as exc:
             raise StoreError(f"lease renewal failed: {exc}") from exc
@@ -383,9 +400,8 @@ class Store:
         self,
         task_id: str,
         worker_id: str,
+        lease_epoch: int,
         error: str,
-        *,
-        backoff: float = 0.0,
     ) -> bool:
         """Move an exhausted task to the DLQ and delete it from ``tasks``.
 
@@ -393,13 +409,24 @@ class Store:
         absent from both tables nor present in both.
 
         ``tasks`` row count therefore always equals pending + in-flight.
+
+        Dead-lettering is terminal and immediate, so there is no ``available_at``
+        to defer and therefore no backoff to apply: the row leaves the queue
+        rather than being scheduled for another attempt.
+
+        Returns ``False`` if the lease was lost. See :meth:`complete_task` for
+        why ``lease_epoch`` is required.
         """
         now = self.clock.now()
         try:
             with transaction(self._conn):
                 row = self._conn.execute(
-                    "SELECT * FROM tasks WHERE id = ? AND lease_owner = ?",
-                    (task_id, worker_id),
+                    """
+                    SELECT * FROM tasks
+                    WHERE id = ? AND lease_owner = ? AND lease_epoch = ?
+                      AND state = 'RUNNING'
+                    """,
+                    (task_id, worker_id, lease_epoch),
                 ).fetchone()
                 if row is None:
                     return False

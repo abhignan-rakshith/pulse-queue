@@ -429,10 +429,12 @@ async def test_heartbeat_keeps_long_handler_alive(store) -> None:
     renewals = 0
 
     class CountingStore(AsyncStore):
-        async def renew_lease(self, task_id, worker_id, lease_ttl):
+        async def renew_lease(self, task_id, worker_id, lease_epoch, lease_ttl):
             nonlocal renewals
             renewals += 1
-            return await super().renew_lease(task_id, worker_id, lease_ttl)
+            return await super().renew_lease(
+                task_id, worker_id, lease_epoch, lease_ttl
+            )
 
     async def handle(ctx):
         await asyncio.sleep(0.35)
@@ -658,6 +660,100 @@ async def test_pool_assigns_distinct_worker_ids(store) -> None:
     assert len(ids) == 5
     assert len(set(ids)) == 5
     assert all(worker_id.startswith("worker-") for worker_id in ids)
+
+
+async def test_pools_sharing_a_database_do_not_share_worker_ids(
+    store, make_store, clock
+) -> None:
+    """Names must be unique across pools, not just within one.
+
+    ``lease_owner`` is what an operator reads to find the process holding a
+    task, so two pools both fielding a ``worker-0`` makes that column lie. The
+    lease epoch is what actually fences a stale write; the name should not be
+    ambiguous either.
+    """
+    other = make_store(clock=clock)
+    first = WorkerPool(store, make_registry(), concurrency=3, handle_signals=False)
+    second = WorkerPool(other, make_registry(), concurrency=3, handle_signals=False)
+
+    first_ids = {w.worker_id for w in first.workers}
+    second_ids = {w.worker_id for w in second.workers}
+    assert len(first_ids) == 3
+    assert len(second_ids) == 3
+    assert not first_ids & second_ids
+
+
+async def test_a_zombie_pool_cannot_overwrite_another_pools_live_lease(
+    store, make_store, clock
+) -> None:
+    """The cross-pool failure the lease epoch exists to prevent.
+
+    Pool A leases a task and stalls past its TTL. Pool B reclaims it and starts
+    its own run while holding the new lease. Pool A then wakes and reports a
+    *permanent failure*. By owner name alone that write is indistinguishable
+    from pool B's own, so it would land and mark FAILED a task that is running
+    fine. The bumped epoch is what separates the two generations.
+    """
+    a_started = asyncio.Event()
+    b_started = asyncio.Event()
+    release_a = asyncio.Event()
+    release_b = asyncio.Event()
+
+    async def stall_then_fail(ctx):
+        a_started.set()
+        await release_a.wait()
+        raise PermanentTaskError("zombie: stale terminal write")
+
+    async def stall_then_succeed(ctx):
+        b_started.set()
+        await release_b.wait()
+
+    store.enqueue({"type": "job"}, task_id="contested", max_attempts=3)
+
+    pool_a = WorkerPool(
+        store, make_registry(job=stall_then_fail),
+        concurrency=1, lease_ttl=10.0, heartbeat_interval=5.0,
+        handle_signals=False, reclaim_enabled=False,
+    )
+    pool_b = WorkerPool(
+        make_store(clock=clock), make_registry(job=stall_then_succeed),
+        concurrency=1, lease_ttl=10.0, heartbeat_interval=5.0,
+        handle_signals=False, reclaim_enabled=False,
+    )
+    # Reads go through a pool's AsyncStore, which serializes with its writes.
+    read = pool_b.async_store.find_task
+
+    # Pool A claims generation 1 and stalls inside the handler.
+    a_run = asyncio.create_task(pool_a.workers[0].run_once())
+    await asyncio.wait_for(a_started.wait(), 2.0)
+    assert (await read("contested")).lease_epoch == 1
+
+    # Its lease expires; pool B reclaims and claims generation 2.
+    clock.advance(11.0)
+    assert await pool_b.async_store.reclaim_expired() == 1
+    b_run = asyncio.create_task(pool_b.workers[0].run_once())
+    await asyncio.wait_for(b_started.wait(), 2.0)
+
+    live = await read("contested")
+    assert live.state is TaskStatus.RUNNING
+    assert live.lease_epoch == 2
+    assert live.attempts == 2
+
+    # The zombie wakes and reports a permanent failure. It must not land.
+    release_a.set()
+    await asyncio.wait_for(a_run, 2.0)
+
+    still_live = await read("contested")
+    assert still_live.state is TaskStatus.RUNNING, "stale write clobbered a lease"
+    assert still_live.lease_epoch == 2
+    assert pool_a.workers[0].stats.lease_lost == 1
+    assert pool_a.workers[0].stats.failed_permanently == 0
+
+    # Pool B's run is untouched, and still completes.
+    release_b.set()
+    await asyncio.wait_for(b_run, 2.0)
+    assert (await read("contested")).state is TaskStatus.COMPLETED
+    assert pool_b.workers[0].stats.completed == 1
 
 
 async def test_queue_filter_is_respected_by_pool(store) -> None:

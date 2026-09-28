@@ -13,7 +13,9 @@ def test_fail_task_schedules_retry(store: Store, clock) -> None:
     store.enqueue({"a": 1})
     task = store.lease_next_task("w1")
 
-    assert store.fail_task(task.id, "w1", "boom", available_at=clock.now() + 60)
+    assert store.fail_task(
+        task.id, "w1", task.lease_epoch, "boom", available_at=clock.now() + 60
+    )
 
     failed = store.get_task(task.id)
     assert failed.state is TaskStatus.RETRY
@@ -26,7 +28,9 @@ def test_fail_task_schedules_retry(store: Store, clock) -> None:
 def test_retry_is_not_claimable_until_available_at(store: Store, clock) -> None:
     store.enqueue({"a": 1})
     task = store.lease_next_task("w1")
-    store.fail_task(task.id, "w1", "boom", available_at=clock.now() + 30)
+    store.fail_task(
+        task.id, "w1", task.lease_epoch, "boom", available_at=clock.now() + 30
+    )
 
     assert store.lease_next_task("w2") is None
     clock.advance(30.0)
@@ -38,14 +42,16 @@ def test_attempts_accumulate_across_retries(store: Store) -> None:
     for expected in (1, 2, 3):
         task = store.lease_next_task("w")
         assert task.attempts == expected
-        store.fail_task(task.id, "w", "boom")
+        store.fail_task(task.id, "w", task.lease_epoch, "boom")
 
 
 def test_permanent_failure_skips_retry(store: Store) -> None:
     store.enqueue({"a": 1})
     task = store.lease_next_task("w1")
 
-    assert store.fail_task(task.id, "w1", "bad payload", retry=False)
+    assert store.fail_task(
+        task.id, "w1", task.lease_epoch, "bad payload", retry=False
+    )
 
     failed = store.get_task(task.id)
     assert failed.state is TaskStatus.FAILED
@@ -62,16 +68,16 @@ def test_fail_task_is_fenced_by_owner(store: Store) -> None:
     store.enqueue({"a": 1})
     task = store.lease_next_task("w1")
 
-    assert store.fail_task(task.id, "impostor", "boom") is False
+    assert store.fail_task(task.id, "impostor", task.lease_epoch, "boom") is False
     assert store.get_task(task.id).state is TaskStatus.RUNNING
 
 
 def test_completed_task_cannot_be_failed(store: Store) -> None:
     store.enqueue({"a": 1})
     task = store.lease_next_task("w1")
-    store.complete_task(task.id, "w1")
+    store.complete_task(task.id, "w1", task.lease_epoch)
 
-    assert store.fail_task(task.id, "w1", "too late") is False
+    assert store.fail_task(task.id, "w1", task.lease_epoch, "too late") is False
     assert store.get_task(task.id).state is TaskStatus.COMPLETED
 
 
@@ -82,7 +88,7 @@ def test_dead_letter_snapshots_and_removes_task(store: Store, clock) -> None:
     store.enqueue({"a": 1}, task_id="doomed", max_attempts=0)
     task = store.lease_next_task("w1")
 
-    assert store.dead_letter(task.id, "w1", "exhausted") is True
+    assert store.dead_letter(task.id, "w1", task.lease_epoch, "exhausted") is True
 
     # Row is gone from the hot table and present in the DLQ.
     assert store.find_task("doomed") is None
@@ -102,7 +108,7 @@ def test_dead_letter_preserves_idempotency_key_and_payload(
     payload = {"email": "a@b.c"}
     store.enqueue(payload, task_id="stable-key")
     task = store.lease_next_task("w1")
-    store.dead_letter(task.id, "w1", "exhausted")
+    store.dead_letter(task.id, "w1", task.lease_epoch, "exhausted")
 
     entry = store.list_dead_letters()[0]
     assert entry["id"] == "stable-key"
@@ -117,13 +123,13 @@ def test_dead_letter_lands_after_exactly_max_attempts(store: Store) -> None:
     first = store.lease_next_task("w")
     assert first.attempts == 1
     assert not _is_exhausted(first.attempts, 2)
-    store.fail_task(first.id, "w", "boom 1")
+    store.fail_task(first.id, "w", first.lease_epoch, "boom 1")
 
     # Attempt 2 fails -> attempts == max_attempts -> dead-letter.
     second = store.lease_next_task("w")
     assert second.attempts == 2
     assert _is_exhausted(second.attempts, 2)
-    assert store.dead_letter(second.id, "w", "boom 2") is True
+    assert store.dead_letter(second.id, "w", second.lease_epoch, "boom 2") is True
 
     assert store.find_task("exhaust") is None
     assert len(store.list_dead_letters()) == 1
@@ -153,7 +159,7 @@ def test_task_count_invariant_holds_through_dlq(store: Store) -> None:
 
     # Dead-lettering two of them removes them from tasks entirely.
     for task, worker in zip(claimed[:2], workers[:2], strict=True):
-        store.dead_letter(task.id, worker, "exhausted")
+        store.dead_letter(task.id, worker, task.lease_epoch, "exhausted")
 
     assert store.count_tasks() == 3
     assert store.count_tasks(TaskStatus.RUNNING) == 3
@@ -167,9 +173,9 @@ def test_state_counts_are_disjoint_and_complete(store: Store) -> None:
     store.enqueue({"n": "c"})
 
     claimed = store.lease_next_task("w")
-    store.complete_task(claimed.id, "w")
+    store.complete_task(claimed.id, "w", claimed.lease_epoch)
     retried = store.lease_next_task("w")
-    store.fail_task(retried.id, "w", "boom")
+    store.fail_task(retried.id, "w", retried.lease_epoch, "boom")
 
     per_state = {state: store.count_tasks(state) for state in TaskStatus}
     assert sum(per_state.values()) == store.count_tasks() == 3
@@ -188,7 +194,7 @@ def test_dead_letter_is_fenced_by_owner(store: Store) -> None:
     store.enqueue({"a": 1})
     task = store.lease_next_task("w1")
 
-    assert store.dead_letter(task.id, "impostor", "boom") is False
+    assert store.dead_letter(task.id, "impostor", task.lease_epoch, "boom") is False
     assert store.find_task(task.id) is not None
     assert store.list_dead_letters() == []
 
@@ -236,7 +242,7 @@ def test_dead_letter_is_transactional_on_failure(store: Store) -> None:
     store._conn = _ExplodingConn(real_conn, "DELETE FROM tasks")
     try:
         with pytest.raises(RuntimeError, match="disk exploded"):
-            store.dead_letter(task.id, "w1", "boom")
+            store.dead_letter(task.id, "w1", task.lease_epoch, "boom")
     finally:
         store._conn = real_conn
 
@@ -253,7 +259,7 @@ def test_dead_letter_preserves_priority(store: Store) -> None:
     store.enqueue({"a": 1}, task_id="urgent", priority=7)
     task = store.lease_next_task("w1")
 
-    store.dead_letter(task.id, "w1", "boom")
+    store.dead_letter(task.id, "w1", task.lease_epoch, "boom")
 
     assert store.list_dead_letters()[0]["priority"] == 7
 
@@ -261,14 +267,14 @@ def test_dead_letter_preserves_priority(store: Store) -> None:
 def test_dlq_row_is_upserted_not_duplicated(store: Store) -> None:
     store.enqueue({"a": 1}, task_id="dup")
     task = store.lease_next_task("w1")
-    store.dead_letter(task.id, "w1", "first failure")
+    store.dead_letter(task.id, "w1", task.lease_epoch, "first failure")
 
     # Re-enqueue the same key. The old task row was deleted on dead-letter, so
     # this is a fresh row whose attempts restart at 0; the DLQ row survives.
     store.enqueue({"a": 1}, task_id="dup")
     retry = store.lease_next_task("w2")
     assert retry.attempts == 1
-    store.dead_letter(retry.id, "w2", "second failure")
+    store.dead_letter(retry.id, "w2", retry.lease_epoch, "second failure")
 
     entries = store.list_dead_letters()
     assert len(entries) == 1
@@ -280,7 +286,7 @@ def test_dead_letter_listing_is_newest_first(store: Store, clock) -> None:
     for i in range(3):
         store.enqueue({"n": i}, task_id=f"task-{i}")
         task = store.lease_next_task(f"w{i}")
-        store.dead_letter(task.id, f"w{i}", f"error {i}")
+        store.dead_letter(task.id, f"w{i}", task.lease_epoch, f"error {i}")
         clock.advance(10.0)
 
     assert [e["id"] for e in store.list_dead_letters()] == [
@@ -296,7 +302,7 @@ def test_dead_letter_listing_is_newest_first(store: Store, clock) -> None:
 def test_replay_requeues_and_clears_the_dlq(store: Store, clock) -> None:
     store.enqueue({"a": 1}, task_id="replay-me", max_attempts=0)
     task = store.lease_next_task("w1")
-    store.dead_letter(task.id, "w1", "boom")
+    store.dead_letter(task.id, "w1", task.lease_epoch, "boom")
 
     replayed = store.replay_dead_letter("replay-me")
 
@@ -313,7 +319,7 @@ def test_replay_requeues_and_clears_the_dlq(store: Store, clock) -> None:
 def test_replay_preserves_identity_payload_queue_and_priority(store: Store) -> None:
     store.enqueue({"to": "a@b.c"}, task_id="k", queue="mail", priority=9)
     original = store.lease_next_task("w1")
-    store.dead_letter(original.id, "w1", "smtp down")
+    store.dead_letter(original.id, "w1", original.lease_epoch, "smtp down")
 
     replayed = store.replay_dead_letter("k")
 
@@ -330,7 +336,7 @@ def test_replay_preserves_identity_payload_queue_and_priority(store: Store) -> N
 def test_replay_records_provenance_in_last_error(store: Store) -> None:
     store.enqueue({"a": 1}, task_id="k")
     task = store.lease_next_task("w1")
-    store.dead_letter(task.id, "w1", "smtp down")
+    store.dead_letter(task.id, "w1", task.lease_epoch, "smtp down")
 
     replayed = store.replay_dead_letter("k")
 
@@ -343,7 +349,7 @@ def test_replay_records_provenance_in_last_error(store: Store) -> None:
 def test_replay_defaults_max_attempts_from_the_store(store: Store) -> None:
     store.enqueue({"a": 1}, task_id="k")
     task = store.lease_next_task("w1")
-    store.dead_letter(task.id, "w1", "boom")
+    store.dead_letter(task.id, "w1", task.lease_epoch, "boom")
 
     assert store.replay_dead_letter("k").max_attempts == DEFAULT_MAX_ATTEMPTS
 
@@ -352,7 +358,7 @@ def test_replay_grants_a_fresh_attempt_budget(store: Store) -> None:
     """Carrying the old attempt count over would re-DLQ it on first failure."""
     store.enqueue({"a": 1}, task_id="k", max_attempts=1)
     task = store.lease_next_task("w1")
-    store.dead_letter(task.id, "w1", "boom")
+    store.dead_letter(task.id, "w1", task.lease_epoch, "boom")
 
     replayed = store.replay_dead_letter("k", max_attempts=3)
     assert replayed.max_attempts == 3
@@ -361,7 +367,7 @@ def test_replay_grants_a_fresh_attempt_budget(store: Store) -> None:
     for expected in (1, 2):
         claimed = store.lease_next_task("w2")
         assert claimed.attempts == expected
-        store.fail_task(claimed.id, "w2", "still broken")
+        store.fail_task(claimed.id, "w2", claimed.lease_epoch, "still broken")
     assert store.find_task("k") is not None
 
     third = store.lease_next_task("w2")
@@ -376,7 +382,7 @@ def test_replay_refuses_when_that_id_is_already_active(store: Store) -> None:
     """Replaying must never clobber an active task."""
     store.enqueue({"v": 1}, task_id="dup", max_attempts=0, priority=4)
     task = store.lease_next_task("w1")
-    store.dead_letter(task.id, "w1", "first failure")
+    store.dead_letter(task.id, "w1", task.lease_epoch, "first failure")
     store.enqueue({"v": 2}, task_id="dup", priority=6)
 
     with pytest.raises(QueueingError, match="already active"):
@@ -394,7 +400,7 @@ def test_replay_is_transactional_on_failure(store: Store) -> None:
     """A failure after the task insert must roll it back and keep the DLQ row."""
     store.enqueue({"a": 1}, task_id="k", max_attempts=0)
     task = store.lease_next_task("w1")
-    store.dead_letter(task.id, "w1", "boom")
+    store.dead_letter(task.id, "w1", task.lease_epoch, "boom")
 
     real_conn = store._conn
     store._conn = _ExplodingConn(real_conn, "DELETE FROM dead_letter_queue")
@@ -412,7 +418,7 @@ def test_replay_is_transactional_on_failure(store: Store) -> None:
 def test_replay_can_target_a_different_queue(store: Store) -> None:
     store.enqueue({"a": 1}, task_id="k", queue="mail")
     task = store.lease_next_task("w1")
-    store.dead_letter(task.id, "w1", "boom")
+    store.dead_letter(task.id, "w1", task.lease_epoch, "boom")
 
     assert store.replay_dead_letter("k", queue="mail-bulk").queue == "mail-bulk"
 
@@ -420,7 +426,7 @@ def test_replay_can_target_a_different_queue(store: Store) -> None:
 def test_replayed_task_is_claimable_and_runs_again(store: Store) -> None:
     store.enqueue({"a": 1}, task_id="k", max_attempts=0)
     task = store.lease_next_task("w1")
-    store.dead_letter(task.id, "w1", "boom")
+    store.dead_letter(task.id, "w1", task.lease_epoch, "boom")
     assert store.lease_next_task("w2") is None
 
     store.replay_dead_letter("k")
@@ -435,7 +441,7 @@ def test_replay_cannot_be_nested_inside_a_transaction(store: Store) -> None:
     """transaction() refuses nesting, so an outer block can't be committed early."""
     store.enqueue({"a": 1}, task_id="k", max_attempts=0)
     task = store.lease_next_task("w1")
-    store.dead_letter(task.id, "w1", "boom")
+    store.dead_letter(task.id, "w1", task.lease_epoch, "boom")
 
     with pytest.raises(RuntimeError, match="cannot be nested"):
         with transaction(store._conn):
