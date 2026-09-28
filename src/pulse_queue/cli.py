@@ -69,7 +69,7 @@ def merge_payload(task_type: str, body: Any) -> dict[str, Any]:
     >>> merge_payload("send_email", {"type": "send_sms"})
     Traceback (most recent call last):
         ...
-    pulse_queue.cli.CliError: payload already declares type 'send_sms', which conflicts with 'send_email'
+    pulse_queue.cli.CliError: payload type 'send_sms' conflicts with 'send_email'
     """
     if not isinstance(body, dict):
         raise CliError(
@@ -78,8 +78,7 @@ def merge_payload(task_type: str, body: Any) -> dict[str, Any]:
     declared = body.get("type")
     if declared is not None and declared != task_type:
         raise CliError(
-            f"payload already declares type {declared!r}, which conflicts "
-            f"with {task_type!r}"
+            f"payload type {declared!r} conflicts with {task_type!r}"
         )
     return {"type": task_type, **body}
 
@@ -241,7 +240,11 @@ def cmd_work(args: argparse.Namespace) -> int:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     registry = load_registry(spec)
-    queues = [q.strip() for q in args.queues.split(",") if q.strip()] if args.queues else None
+    queues = (
+        [q.strip() for q in args.queues.split(",") if q.strip()]
+        if args.queues
+        else None
+    )
 
     log = logging.getLogger("pulse_queue.cli")
     log.info(
@@ -347,7 +350,10 @@ def cmd_dlq_replay(args: argparse.Namespace) -> int:
             )
             if task is None:
                 raise CliError(f"no dead-lettered task with id {args.task_id!r}")
-            print(f"replayed {task.id} (queue={task.queue}, attempts=0/{task.max_attempts})")
+            print(
+                f"replayed {task.id} (queue={task.queue}, "
+                f"attempts=0/{task.max_attempts})"
+            )
             return 0
 
         # Snapshot first: replaying mutates the DLQ while we iterate it.

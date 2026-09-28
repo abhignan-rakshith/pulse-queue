@@ -528,7 +528,10 @@ class Store:
                         max_attempts, available_at, lease_owner,
                         lease_expires_at, last_error, created_at, updated_at,
                         started_at, finished_at
-                    ) VALUES (?, ?, ?, 'PENDING', ?, 0, ?, ?, NULL, NULL, ?, ?, ?, NULL, NULL)
+                    ) VALUES (
+                        ?, ?, ?, 'PENDING', ?, 0, ?, ?, NULL, NULL, ?, ?, ?,
+                        NULL, NULL
+                    )
                     """,
                     (
                         row["id"],

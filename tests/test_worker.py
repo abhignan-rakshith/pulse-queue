@@ -35,7 +35,9 @@ pytestmark = pytest.mark.asyncio
 # --------------------------------------------------------------------- helpers
 
 
-async def wait_until(predicate, *, timeout: float = 3.0, interval: float = 0.005) -> None:
+async def wait_until(
+    predicate, *, timeout: float = 3.0, interval: float = 0.005
+) -> None:
     """Poll an async ``predicate`` until it returns truthy, or fail.
 
     The predicate must be a zero-arg async callable, so that any store access

@@ -19,6 +19,7 @@ pulse-queue = "pulse_queue.cli:main"
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
+    "ruff>=0.16.9",
 ]
 
 [build-system]
@@ -33,3 +34,8 @@ markers = [
     "integration: spawns real subprocesses; deselect with -m 'not integration'",
 ]
 addopts = "-q --strict-markers --doctest-modules"
+
+# Pinned so `uv run ruff check .` reports the same rules on every machine,
+# including CI. Without this, results depend on a developer's personal config.
+[tool.ruff.lint]
+select = ["E", "F", "W"]

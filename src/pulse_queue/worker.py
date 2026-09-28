@@ -87,7 +87,8 @@ def payload_type_resolver(payload: Any, *, key: str = DEFAULT_TYPE_KEY) -> str:
             return value
 
     raise UnknownTaskType(
-        f"payload must be a mapping with a non-empty {key!r} key; got {type(payload).__name__}"
+        f"payload must be a mapping with a non-empty {key!r} key; "
+        f"got {type(payload).__name__}"
     )
 
 
@@ -155,7 +156,8 @@ class HandlerRegistry:
         except KeyError:
             known = ", ".join(sorted(self._handlers)) or "<none>"
             raise UnknownTaskType(
-                f"no handler registered for task type {task_type!r}; known types: {known}"
+                f"no handler registered for task type {task_type!r}; "
+                f"known types: {known}"
             ) from None
 
     def types(self) -> frozenset[str]:
@@ -229,7 +231,11 @@ class AsyncStore:
         return await self._call(self._store.enqueue, *args, **kwargs)
 
     async def lease_next_task(
-        self, worker_id: str, *, queues: Sequence[str] | None = None, lease_ttl: float = 60.0
+        self,
+        worker_id: str,
+        *,
+        queues: Sequence[str] | None = None,
+        lease_ttl: float = 60.0,
     ) -> Task | None:
         return await self._call(
             self._store.lease_next_task,

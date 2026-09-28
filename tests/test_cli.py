@@ -378,7 +378,10 @@ def test_work_plumbs_options_into_the_pool(
 
 def test_work_defaults_are_sane(db_path, capsys, handler_module, fake_run) -> None:
     module = handler_module(REGISTRY_MODULE)
-    run(["--db", str(db_path), "work", "--handlers", module, "--log-level", "ERROR"], capsys)
+    run(
+        ["--db", str(db_path), "work", "--handlers", module, "--log-level", "ERROR"],
+        capsys,
+    )
 
     kwargs = fake_run["kwargs"]
     assert kwargs["concurrency"] == 4
